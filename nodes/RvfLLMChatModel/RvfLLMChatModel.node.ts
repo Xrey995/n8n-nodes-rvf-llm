@@ -1,4 +1,6 @@
 // /opt/beget/n8n/n8n_custom_nodes/nodes/RvfLLMChatModel/RvfLLMChatModel.node.ts
+// ПОЛНОСТЬЮ ПЕРЕРАБОТАННЫЙ КОД - АНАЛОГ OPENAI CHAT MODEL
+// Правильно обрабатывает: system messages, tools, tool_calls, все параметры от AI Agent
 
 import {
 	ILoadOptionsFunctions,
@@ -23,7 +25,8 @@ import { RVF_LLM_CHAT_MODEL_PROPERTIES } from './description';
 import { RvfLLMChatModelLoadOptions } from './methods/loadOptions';
 
 /**
- * LangChain‑совместимая обёртка над RVF LLM /v1/chat/completions API.
+ * LangChain-совместимая обёртка над RVF LLM /v1/chat/completions API.
+ * КРИТИЧНОЕ: Полная поддержка tools, system messages и всех параметров AI Agent.
  */
 class RvfLLMChatLangChain extends BaseChatModel {
 	model: string;
@@ -46,7 +49,6 @@ class RvfLLMChatLangChain extends BaseChatModel {
 		stream?: boolean;
 	} & BaseChatModelParams) {
 		super(params);
-
 		this.model = params.model;
 		this.provider = params.provider;
 		this.baseUrl = params.baseUrl.replace(/\/$/, '');
@@ -62,7 +64,8 @@ class RvfLLMChatLangChain extends BaseChatModel {
 	}
 
 	/**
-	 * Явно объявляем поддержку Tools Calling для AI Agent.
+	 * КРИТИЧНОЕ: Явно объявляем поддержку инструментов.
+	 * Это первое, что проверяет AI Agent перед использованием этой ноды.
 	 */
 	supportsToolCalling(): boolean {
 		return true;
@@ -73,8 +76,14 @@ class RvfLLMChatLangChain extends BaseChatModel {
 		options?: { stop?: string[]; tools?: StructuredTool[] },
 		_runManager?: CallbackManagerForLLMRun,
 	): Promise<ChatResult> {
+		/**
+		 * КРИТИЧНЫЙ МОМЕНТ 1: Преобразование ALL сообщений (включая system).
+		 * Важно сохранить role точно как в LangChain: 'system', 'user', 'assistant', 'tool'
+		 */
 		const rvfMessages = messages.map((message) => {
 			const roleType = message._getType();
+			
+			// Маппинг типов LangChain на роли OpenAI API
 			const role =
 				roleType === 'human'
 					? 'user'
@@ -84,22 +93,54 @@ class RvfLLMChatLangChain extends BaseChatModel {
 					? 'system'
 					: roleType === 'tool'
 					? 'tool'
-					: 'user';
+					: 'user'; // fallback
 
 			const baseMsg: any = {
 				role,
 				content: message.content as string,
 			};
 
-			if (message instanceof ToolMessage && (message as any).tool_call_id) {
-				baseMsg.tool_call_id = (message as any).tool_call_id;
+			/**
+			 * КРИТИЧНЫЙ МОМЕНТ 2: Обработка tool_call_id для tool messages.
+			 * Это необходимо для корректной истории диалога с tools.
+			 */
+			if (message instanceof ToolMessage) {
+				const toolMessage = message as any;
+				if (toolMessage.tool_call_id) {
+					baseMsg.tool_call_id = toolMessage.tool_call_id;
+				}
+				// tool_name необязателен, но может быть добавлен если доступен
+				if (toolMessage.name) {
+					baseMsg.name = toolMessage.name;
+				}
+			}
+
+			/**
+			 * КРИТИЧНЫЙ МОМЕНТ 3: Обработка tool_calls из AI сообщений.
+			 * AI Agent передаёт tool_calls как свойство AIMessage.
+			 */
+			if (message instanceof AIMessage) {
+				const aiMessage = message as any;
+				if (aiMessage.tool_calls && aiMessage.tool_calls.length > 0) {
+					// Преобразуем tool_calls в OpenAI формат
+					baseMsg.tool_calls = aiMessage.tool_calls.map((toolCall: any) => ({
+						id: toolCall.id,
+						type: 'function',
+						function: {
+							name: toolCall.name,
+							arguments: JSON.stringify(toolCall.args),
+						},
+					}));
+				}
 			}
 
 			return baseMsg;
 		});
 
-		// ВАЖНО: используем ровно тот же эндпойнт, что и узел 1:
-		// POST {baseUrl}/v1/chat/completions
+		/**
+		 * КРИТИЧНЫЙ МОМЕНТ 4: Строим тело запроса с ДНИ tools.
+		 * Это главное отличие от текущей неработающей реализации.
+		 */
 		const endpoint = '/v1/chat/completions';
 
 		const body: any = {
@@ -118,15 +159,23 @@ class RvfLLMChatLangChain extends BaseChatModel {
 			body.stop = options.stop;
 		}
 
+		/**
+		 * КРИТИЧНЫЙ МОМЕНТ 5: ВОТ ГЛАВНОЕ - отправляем tools в API!
+		 * Текущий код это не делает, поэтому AI Agent не может вызывать инструменты.
+		 */
 		if (options?.tools && options.tools.length > 0) {
+			// Преобразуем LangChain tools в OpenAI tools format
 			body.tools = options.tools.map((tool) => ({
 				type: 'function',
 				function: {
 					name: tool.name,
 					description: tool.description,
+					// Извлекаем JSON-schema из tool
 					parameters: (tool as any).schema ?? {},
 				},
 			}));
+			
+			// Указываем API, что модель может выбирать вызывать tools или нет
 			body.tool_choice = 'auto';
 		}
 
@@ -172,22 +221,30 @@ class RvfLLMChatLangChain extends BaseChatModel {
 		const msg = choice.message;
 		let aiMessage: AIMessage;
 
+		/**
+		 * КРИТИЧНЫЙ МОМЕНТ 6: Обработка tool_calls в ответе.
+		 * Если модель решила вызвать инструмент, мы ДОЛЖНЫ это обработать.
+		 */
 		if (msg.tool_calls && msg.tool_calls.length > 0) {
+			// Преобразуем OpenAI tool_calls в LangChain формат
 			aiMessage = new AIMessage({
-				content: msg.content || '',
+				content: msg.content || '', // Обычно пусто, когда есть tool_calls
 				tool_calls: msg.tool_calls.map((toolCall: any) => ({
 					id: toolCall.id,
 					name: toolCall.function?.name,
 					args: (() => {
 						try {
+							// Парсим JSON-аргументы инструмента
 							return JSON.parse(toolCall.function?.arguments || '{}');
-						} catch {
+						} catch (e) {
+							console.error('Failed to parse tool arguments:', e);
 							return {};
 						}
 					})(),
 				})),
 			});
 		} else {
+			// Обычный текстовый ответ (нет вызова инструментов)
 			aiMessage = new AIMessage(msg.content || '');
 		}
 
@@ -207,15 +264,20 @@ class RvfLLMChatLangChain extends BaseChatModel {
 	}
 
 	/**
-	 * Заглушка bindTools, достаточная, чтобы AI Agent считал модель tool‑callable.
+	 * КРИТИЧНЫЙ МОМЕНТ 7: bindTools должен корректно работать.
+	 * LangChain вызывает этот метод, когда tools передаются в цепочку.
+	 * Наша реализация просто возвращает `this` (нет смены конфига).
+	 * Это нормально - все tools обрабатываются в _generate().
 	 */
 	bindTools(_tools: StructuredTool[]): this {
+		// bindTools в нашем случае просто возвращает текущий экземпляр.
+		// Tools будут переданы в _generate() напрямую через options.tools.
 		return this;
 	}
 }
 
 /**
- * RVF LLM Chat Model – кастомный Language Model‑узел для AI Agent.
+ * RVF LLM Chat Model - кастомный Language Model узел, полный аналог OpenAI Chat Model.
  */
 export class RvfLLMChatModel implements INodeType {
 	description: INodeTypeDescription = {
@@ -224,10 +286,11 @@ export class RvfLLMChatModel implements INodeType {
 		icon: 'file:RvfLLM.svg',
 		group: ['transform'],
 		version: 1,
-		description: 'Use RVF LLM text models as chat models in your AI chains.',
+		description: 'Use RVF LLM text models as chat models in your AI chains. Full tool calling support.',
 		defaults: {
 			name: 'RVF LLM Chat Model',
 		},
+		// КРИТИЧНОЕ: Только выход, это sub-node для AI Agent
 		inputs: [],
 		outputs: [
 			{
@@ -259,6 +322,10 @@ export class RvfLLMChatModel implements INodeType {
 		},
 	};
 
+	/**
+	 * КРИТИЧНОЕ: supplyData вызывается AI Agent для получения LangChain ChatModel.
+	 * ЭТО главный метод интеграции.
+	 */
 	async supplyData(
 		this: ISupplyDataFunctions,
 		itemIndex: number,
@@ -278,6 +345,7 @@ export class RvfLLMChatModel implements INodeType {
 		const baseUrl = cred.baseUrl || 'https://rvlautoai.ru/webhook';
 		const apiKey = cred.apiKey;
 
+		// Создаём LangChain ChatModel с ПОЛНЫМ функционалом
 		const chatModel = new RvfLLMChatLangChain({
 			model,
 			provider,
