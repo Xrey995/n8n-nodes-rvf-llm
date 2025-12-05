@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-rvf-llm",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "RVF LLM nodes for n8n: Universal AI Gateway integration",
   "keywords": [
     "n8n-community-node-package"
