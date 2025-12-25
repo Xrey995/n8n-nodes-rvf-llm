@@ -319,6 +319,12 @@ AI Agent (используя RVF LLM Chat Model)
 ### *Доступные провайдеры и модели
 (список доступных провайдеров и моделей обновляется ежедневно, в 02:00 по МСК и может отличаться от списка ниже)
 
+Пример для просмотра актуального списка в PowerShell:
+
+```powershell
+Invoke-RestMethod -Uri "https://rvlautoai.ru/webhook/v1/models/list" -Method Get | Select-Object -ExpandProperty text
+```
+
 | Провайдер | Популярные модели | Примечания |
 |-----------|---|---|
 | **OpenAI** | gpt-4, gpt-3.5-turbo | Отраслевой стандарт, лучший для общих задач |
